@@ -1,6 +1,6 @@
 import { LinearClient } from "@linear/sdk";
-
-const LINEAR_TOKEN = process.env.LINEAR_TOKEN;
+import { LINEAR_TOKEN } from "../env";
+import type { LabelType } from "../types";
 
 export const linearClient = new LinearClient({
   apiKey: LINEAR_TOKEN,
@@ -8,17 +8,9 @@ export const linearClient = new LinearClient({
 
 /**
  * Get a Linear label given its information. If label  doesn't
- * exist, it will be created with the information passed
+ * exist, it will be created with the information passed.
  */
-export async function getLabel({
-  name,
-  description,
-  color,
-}: {
-  name: string;
-  description?: string;
-  color: `#${string}`;
-}) {
+export async function getLabel({ name, description, color }: LabelType) {
   // first get related labels
   const relatedLabels = await linearClient.issueLabels({
     filter: {
