@@ -4,8 +4,9 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run src/server/webhook.ts",
-    "dev": "bun --hot run src/server/webhook.ts"
+    "start": "bun run app.js",
+    "dev": "bun --hot run src/server/server.ts",
+    "build": "bun build src/server/server.ts > app.js"
   },
   "devDependencies": {
     "@types/bun": "latest"
