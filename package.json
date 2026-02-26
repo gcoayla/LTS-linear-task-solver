@@ -3,6 +3,10 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "start": "bun run src/server/webhook.ts",
+    "dev": "bun --hot run src/server/webhook.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
