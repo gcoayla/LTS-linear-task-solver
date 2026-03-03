@@ -21,86 +21,97 @@ import {
   HumanMessage,
   SystemMessage,
 } from "@langchain/core/messages";
-import { LLM_TOKEN, GITHUB_TOKEN } from "../../env";
+import { LLM_TOKEN } from "../../env";
+import { octokit } from "../../github/octokit";
+import { getGithubRepoUrl, appendGithubToken, AI_MODEL } from "../../shared";
 
+// defining the webhook route
 export const webhookRoute: ServerRoute = {
   async GET() {
-    return Response.json({ message: "Webhook endpoint active" });
+    return Response.json({ message: "Webhook active" });
   },
 
   async POST(req) {
-    const { data: issue } = (await req.json()) as { data: IssueWebhookPayload };
+    console.log("🚀 Webhook received.");
+    const { data: issuePayload } = (await req.json()) as {
+      data: IssueWebhookPayload;
+    };
 
-    // Safety check for payload structure
-    if (!("title" in issue))
-      return Response.json({ message: "Ignored: No title" });
+    // fetch the issue
+    let freshIssue: any = issuePayload;
+    try {
+      freshIssue = await linearClient.issue(issuePayload.id);
+    } catch (e) {
+      console.warn("⚠️ Could not fetch fresh issue, using payload.");
+    }
 
-    // Initial Candidate Check
-    const labelNames = issue.labels.map((l) => l.name.toLowerCase());
-    if (!labelNames.includes("ai-candidate"))
+    const labels = freshIssue.labels
+      ? await (
+          await freshIssue.labels()
+        ).nodes
+      : [];
+    const labelNames = labels.map((l: any) => l.name.toLowerCase());
+    const labelIds = labels.map((l: any) => l.id);
+
+    // IGNORE if NOT ai-candidate
+    if (!labelNames.includes("ai-candidate")) {
       return Response.json({ message: "Ignored: Not an AI candidate" });
+    }
 
-    // Fetch AI status labels for filtering
+    // IGNORE if ALREADY in progress/done/failed
     const [aiInProgressLabel, aiFailedLabel, aiDoneLabel] = await Promise.all([
       getLabel(aiInProgressLabelPayload),
       getLabel(aiFailedLabelPayload),
       getLabel(aiDoneLabelPayload),
     ]);
 
-    // Check if issue is already in a terminal or active state
-    // We check the issue's labelIds array to see if any of our AI status labels are present.
     const activeLabelIds = [
       aiInProgressLabel.id,
       aiFailedLabel.id,
       aiDoneLabel.id,
     ];
-    const isAlreadyProcessed = issue.labelIds.some((id) =>
-      activeLabelIds.includes(id)
-    );
-
-    if (isAlreadyProcessed) {
-      return Response.json({
-        message: "Ignored: Issue already has AI status labels",
-      });
+    if (labelIds.some((id: string) => activeLabelIds.includes(id))) {
+      console.log("⚠️ Ignored: Already processed or in progress.");
+      return Response.json({ message: "Ignored: Already processed" });
     }
 
-    // Repo Setup
-    const project = await linearClient.project(issue.projectId!);
-    const repoUrl = (await project.externalLinks()).nodes.find((l) =>
-      l.url.startsWith("https://github.com")
-    )?.url;
-
-    if (!repoUrl) return Response.json({ error: "No Repo URL" });
-
-    // Execution
-    const sandbox = await Sandbox.create();
-
+    // Only now do we update Linear
     try {
-      // Mark as In Progress
-      await linearClient.updateIssue(issue.id, {
+      await linearClient.updateIssue(freshIssue.id, {
         addedLabelIds: [aiInProgressLabel.id],
       });
+    } catch (e) {
+      console.log("⚠️ Could not lock issue (concurrency collision). Ignoring.");
+      return Response.json({ message: "Ignored: Locked" });
+    }
 
-      // Clone Repo
-      const repoUrlWithToken = repoUrl.replace(
-        "https://",
-        `https://${GITHUB_TOKEN}@`
+    console.log("📦 Creating sandbox...");
+    const sandbox = await Sandbox.create();
+    const REPO_PATH = "/home/user/repo";
+
+    try {
+      console.log("⬇️ Cloning repo...");
+      await sandbox.commands.run(
+        `git clone ${appendGithubToken(await getGithubRepoUrl(freshIssue.projectId!)!)} ${REPO_PATH}`
       );
       await sandbox.commands.run(
-        `git clone ${repoUrlWithToken} /home/user/repo`
+        `git config --global user.email "ai@linear.app" && git config --global user.name "AI Agent"`,
+        { cwd: REPO_PATH }
       );
 
-      // Initialize Agent
-      const tools = getLangchainGithubTools(sandbox, repoUrl);
+      console.log("🛠 Initializing Agent...");
+      const tools = getLangchainGithubTools(
+        sandbox,
+        await getGithubRepoUrl(freshIssue.projectId!)!
+      );
       const model = new ChatGoogleGenerativeAI({
-        model: "gemini-3-flash-preview",
+        model: AI_MODEL,
         apiKey: LLM_TOKEN,
       }).bindTools(tools);
 
       const AgentState = Annotation.Root({
         messages: Annotation<BaseMessage[]>({ reducer: messagesStateReducer }),
       });
-
       const workflow = new StateGraph(AgentState)
         .addNode("agent", async (state) => ({
           messages: [await model.invoke(state.messages)],
@@ -108,41 +119,83 @@ export const webhookRoute: ServerRoute = {
         .addNode("tools", new ToolNode(tools))
         .addEdge("__start__", "agent")
         .addConditionalEdges("agent", (state) => {
-          const lastMessage = state.messages[state.messages.length - 1] as any;
-          return lastMessage.tool_calls?.length > 0 ? "tools" : "__end__";
+          const last = state.messages[state.messages.length - 1] as any;
+          return last.tool_calls?.length > 0 ? "tools" : "__end__";
         })
         .addEdge("tools", "agent");
 
-      const app = workflow.compile();
+      const app = workflow.compile().withConfig({ recursionLimit: 25 });
 
+      console.log("🧠 Running Agent loop...");
       await app.invoke({
         messages: [
-          new SystemMessage(
-            "You are an expert Engineer. Solve the issue. MUST use applyFixAndCreatePR to finish."
-          ),
+          new SystemMessage(`You are a Senior Software Engineer.
+            YOUR PROCESS:
+            1. EXPLORE: Use 'getProjectResources' and 'listFiles'.
+            2. READ: Use 'getFileContent'.
+            3. WRITE: Use 'writeFile' to apply changes.
+            - Once changes are done, output "TASK_COMPLETE".`),
           new HumanMessage(
-            `Issue: ${issue.title}\nDescription: ${issue.description}`
+            `Issue: ${freshIssue.title}\nDescription: ${freshIssue.description}`
           ),
         ],
       });
+      console.log("✅ Agent loop finished.");
 
-      // Success Path
-      await linearClient.updateIssue(issue.id, {
+      const branchName = `ai-fix-${freshIssue.id}-${Date.now()}`;
+      console.log(`🌿 Branching: ${branchName}`);
+      await sandbox.commands.run(`git checkout -b ${branchName}`, {
+        cwd: REPO_PATH,
+      });
+
+      const status = await sandbox.commands.run("git status --porcelain", {
+        cwd: REPO_PATH,
+      });
+      if (status.stdout.trim() !== "") {
+        console.log("💾 Committing and Pushing...");
+        await sandbox.commands.run("git add .", { cwd: REPO_PATH });
+        await sandbox.commands.run(
+          `git commit -m "AI Fix: ${freshIssue.title}"`,
+          { cwd: REPO_PATH }
+        );
+        await sandbox.commands.run(`git push origin ${branchName}`, {
+          cwd: REPO_PATH,
+        });
+
+        const [owner, repo] = (await getGithubRepoUrl(freshIssue.projectId!)!)!
+          .split("github.com/")[1]!
+          .split("/") as [string, string];
+
+        const { data: repoData } = await octokit.rest.repos.get({
+          owner,
+          repo: repo.replace(".git", ""),
+        });
+
+        await octokit.rest.pulls.create({
+          owner,
+          repo: repo.replace(".git", ""),
+          title: `AI Fix: ${freshIssue.title}`,
+          body: `Automated PR generated by AI. \n\nRelated Issue: ${freshIssue.title}`,
+          head: branchName,
+          base: repoData.default_branch,
+          draft: true,
+        });
+        console.log("🎉 PR Created.");
+      }
+
+      await linearClient.updateIssue(freshIssue.id, {
         addedLabelIds: [aiDoneLabel.id],
         removedLabelIds: [aiInProgressLabel.id],
       });
     } catch (error) {
-      console.error("Agent execution error:", error);
-
-      // Failure Path
-      await linearClient.updateIssue(issue.id, {
+      console.error("❌ Agent error:", error);
+      await linearClient.updateIssue(freshIssue.id, {
         addedLabelIds: [aiFailedLabel.id],
         removedLabelIds: [aiInProgressLabel.id],
       });
     } finally {
       await sandbox.kill();
     }
-
     return Response.json({ status: "ok" });
   },
 };
