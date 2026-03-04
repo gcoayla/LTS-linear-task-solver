@@ -1,12 +1,10 @@
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { Sandbox } from "e2b";
+import { REPO_PATH, parseOwnerRepo } from "../shared";
 
 export function getLangchainGithubTools(sandbox: Sandbox, repoUrl: string) {
-  const repoInfo = repoUrl
-    .replace("https://github.com/", "")
-    .replace(".git", "");
-  const [owner, repo] = repoInfo.split("/") as [string, string];
+  const { owner, repo } = parseOwnerRepo(repoUrl);
 
   return [
     tool(async () => ({ repoUrl, owner, repo, found: true }), {
@@ -19,7 +17,7 @@ export function getLangchainGithubTools(sandbox: Sandbox, repoUrl: string) {
       async () => {
         const result = await sandbox.commands.run(
           "find . -maxdepth 3 -type f -not -path '*/.*'",
-          { cwd: "/home/user/repo" }
+          { cwd: REPO_PATH }
         );
         return result.stdout;
       },
@@ -33,7 +31,7 @@ export function getLangchainGithubTools(sandbox: Sandbox, repoUrl: string) {
     tool(
       async ({ path }) => {
         try {
-          return await sandbox.files.read(`/home/user/repo/${path}`);
+          return await sandbox.files.read(`${REPO_PATH}/${path}`);
         } catch (e) {
           return `Error: File not found at ${path}`;
         }
@@ -47,7 +45,7 @@ export function getLangchainGithubTools(sandbox: Sandbox, repoUrl: string) {
 
     tool(
       async ({ filePath, newContent }) => {
-        await sandbox.files.write(`/home/user/repo/${filePath}`, newContent);
+        await sandbox.files.write(`${REPO_PATH}/${filePath}`, newContent);
         return `File ${filePath} written to sandbox successfully.`;
       },
       {
